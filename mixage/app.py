@@ -14,8 +14,11 @@ from . import __version__
 from .engine import Cancelled, describe_devices, log_path, make_instrumental, output_path_for, speed_test
 
 DEVICE_CHOICES = [("Automatique (carte graphique si possible)", "auto"),
-                  ("Carte graphique", "gpu"),
-                  ("Processeur", "cpu")]
+                  ("Carte graphique + processeur ensemble", "both"),
+                  ("Carte graphique seule", "gpu"),
+                  ("Processeur seul", "cpu")]
+MODEL_CHOICES = [("Qualité – HT-Demucs (quelques minutes sur processeur)", "demucs"),
+                 ("Rapide – Spleeter (quelques secondes, qualité moindre)", "spleeter")]
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -43,8 +46,8 @@ class App:
     def __init__(self) -> None:
         self.root = TkinterDnD.Tk() if _HAS_DND else tk.Tk()
         self.root.title(f"Mixage {__version__} – Retirer la voix d'une chanson")
-        self.root.geometry("600x470")
-        self.root.minsize(520, 420)
+        self.root.geometry("640x500")
+        self.root.minsize(560, 450)
         self.root.configure(padx=18, pady=16)
 
         self.src: Path | None = None
@@ -55,6 +58,7 @@ class App:
 
         self.fmt = tk.StringVar(value="wav")
         self.device_label = tk.StringVar(value=DEVICE_CHOICES[0][0])
+        self.model_label = tk.StringVar(value=MODEL_CHOICES[0][0])
         self._build()
         self.root.after(100, self._poll)
 
@@ -90,10 +94,16 @@ class App:
         ttk.Radiobutton(opts, text="WAV (qualité maximale)", variable=self.fmt, value="wav").pack(side="left", padx=(8, 0))
         ttk.Radiobutton(opts, text="MP3 (plus léger)", variable=self.fmt, value="mp3").pack(side="left", padx=(8, 0))
 
+        mdl = ttk.Frame(r)
+        mdl.pack(fill="x", pady=(4, 0))
+        ttk.Label(mdl, text="Modèle :").pack(side="left")
+        ttk.Combobox(mdl, textvariable=self.model_label, state="readonly", width=52,
+                     values=[lbl for lbl, _ in MODEL_CHOICES]).pack(side="left", padx=(8, 0))
+
         dev = ttk.Frame(r)
         dev.pack(fill="x", pady=(4, 0))
         ttk.Label(dev, text="Calcul :").pack(side="left")
-        ttk.Combobox(dev, textvariable=self.device_label, state="readonly", width=38,
+        ttk.Combobox(dev, textvariable=self.device_label, state="readonly", width=34,
                      values=[lbl for lbl, _ in DEVICE_CHOICES]).pack(side="left", padx=(8, 0))
         ttk.Button(dev, text="Test de vitesse", command=self.run_speed_test, width=15).pack(side="right")
         ttk.Button(dev, text="Infos matériel", command=self.show_info, width=14).pack(side="right", padx=(0, 6))
@@ -114,7 +124,7 @@ class App:
 
         ttk.Label(r, text="Tout se passe sur votre ordinateur, rien n'est envoyé en ligne "
                           "(sauf le téléchargement du modèle au premier lancement si besoin).",
-                  foreground="#6b7280", wraplength=520, font=("", 8)).pack(anchor="w", pady=(14, 0))
+                  foreground="#6b7280", wraplength=580, font=("", 8)).pack(anchor="w", pady=(14, 0))
 
     # -------------------------------------------------------------- actions
     def _on_drop(self, event) -> None:
@@ -153,6 +163,12 @@ class App:
                 return code
         return "auto"
 
+    def model(self) -> str:
+        for lbl, code in MODEL_CHOICES:
+            if lbl == self.model_label.get():
+                return code
+        return "demucs"
+
     def show_info(self) -> None:
         messagebox.showinfo("Mixage – matériel", describe_devices() + f"\n\nJournal : {log_path()}")
 
@@ -184,15 +200,15 @@ class App:
             return
         self.cancel.clear()
         self._set_busy(True)
-        self.worker = threading.Thread(target=self._work, args=(self.src, dst, self.device()),
-                                       daemon=True)
+        self.worker = threading.Thread(target=self._work,
+                                       args=(self.src, dst, self.model(), self.device()), daemon=True)
         self.worker.start()
 
-    def _work(self, src: Path, dst: Path, device: str) -> None:
+    def _work(self, src: Path, dst: Path, model: str, device: str) -> None:
         info: dict = {}
         try:
             out = make_instrumental(
-                src, dst, fmt=self.fmt.get(), device=device,
+                src, dst, fmt=self.fmt.get(), model=model, device=device,
                 progress=lambda f, m: self.events.put(("progress", f, m)),
                 cancel=self.cancel, info=info,
             )

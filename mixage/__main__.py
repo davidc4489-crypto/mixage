@@ -9,10 +9,13 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] not in ("--gui",):
         import argparse
         from pathlib import Path
-        from .engine import describe_devices, make_instrumental
+        from .engine import DEVICES, MODELS, describe_devices, make_instrumental, speed_test
 
         if argv[0] == "--info":
             print(describe_devices())
+            return 0
+        if argv[0] == "--speed-test":
+            print(speed_test(progress=lambda f, m: print(f"[{f * 100:3.0f}%] {m}", flush=True)))
             return 0
 
         p = argparse.ArgumentParser(prog="mixage",
@@ -20,9 +23,12 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("input", help="fichier audio (mp3, wav, flac, ogg…)")
         p.add_argument("-o", "--output", help="fichier de sortie (défaut : à côté de l'entrée)")
         p.add_argument("--mp3", action="store_true", help="écrire un MP3 au lieu d'un WAV")
+        p.add_argument("--model", choices=sorted(MODELS), default="demucs",
+                       help="demucs (qualité, défaut) ou spleeter (rapide, processeur)")
         p.add_argument("--threads", type=int, default=None, help="threads CPU (défaut : 4 max)")
-        p.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto",
-                       help="auto (carte graphique si possible), gpu (obligatoire) ou cpu")
+        p.add_argument("--device", choices=DEVICES, default="auto",
+                       help="auto (carte graphique si possible, processeur en renfort si assez de "
+                            "mémoire), both (carte + processeur), gpu (carte seule) ou cpu")
         a = p.parse_args(argv)
 
         def show(frac: float, msg: str) -> None:
@@ -30,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
 
         info: dict = {}
         out = make_instrumental(Path(a.input), Path(a.output) if a.output else None,
-                                fmt="mp3" if a.mp3 else "wav", device=a.device,
+                                fmt="mp3" if a.mp3 else "wav", model=a.model, device=a.device,
                                 threads=a.threads, progress=show, info=info)
         for note in info.get("notes", []):
             print(f"Note : {note}")
