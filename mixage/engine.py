@@ -58,10 +58,14 @@ N_SAMPLES = int(SEGMENT_S * MODEL_SAMPLE_RATE)  # 343 980, figé dans le graphe 
 SOURCES = ("drums", "bass", "other", "vocals")
 VOCALS_ROW = SOURCES.index("vocals")
 
-MODEL_FILENAME = "htdemucs_ft_vocals_safe16.onnx"
-MODEL_URL = ("https://huggingface.co/monteslu/htdemucs-ft-webgpu/"
-             "resolve/main/" + MODEL_FILENAME)
-MODEL_SIZE_BYTES = 87_695_109
+#: Modèle core converti en fp32 complet (tools/convert_fp32.py) à partir de
+#: monteslu/htdemucs-ft-webgpu (fp16). En fp16, la variance du prologue
+#: déborde sur carte graphique (sortie NaN = silence) ; en fp32 le résultat
+#: est exact et le CPU va 30 % plus vite (plus d'émulation fp16).
+MODEL_FILENAME = "htdemucs_ft_vocals_fp32.onnx"
+MODEL_URL = ("https://github.com/davidc4489-crypto/mixage/releases/download/"
+             "model-v1/" + MODEL_FILENAME)
+MODEL_SIZE_BYTES = 174_505_377
 
 ProgressCb = Callable[[float, str], None]  # (fraction 0..1, message)
 
@@ -108,7 +112,7 @@ def download_model(progress: ProgressCb | None = None,
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / MODEL_FILENAME
     tmp = dest.with_suffix(".part")
-    req = urllib.request.Request(MODEL_URL, headers={"User-Agent": "Mixage/0.1"})
+    req = urllib.request.Request(MODEL_URL, headers={"User-Agent": "Mixage"})
     with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as f:
         total = int(resp.headers.get("Content-Length") or MODEL_SIZE_BYTES)
         done = 0
@@ -345,6 +349,10 @@ class Separator:
         if "err" in result:
             self._fallback(f"échec sur la carte graphique ({type(result['err']).__name__}: {result['err']})")
             return self._run_cpu(x)
+        y = result["y"]
+        if not np.isfinite(y).all() or (np.abs(x).max() > 1e-4 and np.abs(y).max() < 1e-7):
+            self._fallback("résultat invalide sur la carte graphique (NaN ou silence)")
+            return self._run_cpu(x)
         dt = time.time() - t0
         self.gpu_runs += 1
         log.info("morceau GPU %d : %.1f s", self.gpu_runs, dt)
@@ -503,18 +511,24 @@ def speed_test(progress: ProgressCb | None = None,
     setup_logging()
     lines = [describe_devices(), ""]
     model = ensure_model(progress, cancel)
-    x = (np.random.randn(2, N_SAMPLES) * 0.1).astype(np.float32)
+    # signal de test déterministe : deux sinus + bruit (évite un vrai fichier)
+    t = np.arange(N_SAMPLES, dtype=np.float32) / MODEL_SAMPLE_RATE
+    rng = np.random.default_rng(0)
+    x = np.stack([0.3 * np.sin(2 * np.pi * 220 * t), 0.3 * np.sin(2 * np.pi * 330 * t)])
+    x = (x + 0.02 * rng.standard_normal(x.shape)).astype(np.float32)
+    results: dict[str, np.ndarray] = {}
     for device, label in (("gpu", "Carte graphique"), ("cpu", "Processeur")):
         if progress:
             progress(0.5 if device == "cpu" else 0.1, f"Test {label}…")
         try:
             sep = Separator(model, device)
             t0 = time.time()
-            sep.run(x, cancel)                  # première passe (compilation)
+            y = sep.run(x, cancel)              # première passe (compilation)
             first = time.time() - t0
             t0 = time.time()
-            sep.run(x, cancel)
+            y = sep.run(x, cancel)
             second = time.time() - t0
+            results[device] = y
             if sep.notes:
                 lines.append(f"{label} : {'; '.join(sep.notes)}")
             else:
@@ -525,6 +539,14 @@ def speed_test(progress: ProgressCb | None = None,
             raise
         except Exception as exc:  # noqa: BLE001
             lines.append(f"{label} : indisponible ({type(exc).__name__}: {exc})")
+    if "gpu" in results and "cpu" in results:
+        g, c = results["gpu"], results["cpu"]
+        if not np.isfinite(g).all():
+            lines.append("Comparaison : la carte graphique renvoie des NaN (résultat invalide).")
+        else:
+            rel = float(np.linalg.norm(g - c) / (np.linalg.norm(c) + 1e-9))
+            verdict = "identique" if rel < 1e-2 else ("proche" if rel < 1e-1 else "DIFFÉRENT")
+            lines.append(f"Comparaison carte/processeur : écart relatif {rel:.1e} ({verdict}).")
     lines += ["", f"Journal : {log_path()}"]
     text = "\n".join(lines)
     log.info("test de vitesse :\n%s", text)

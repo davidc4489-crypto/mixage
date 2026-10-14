@@ -24,12 +24,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: Download the model (84 MB)
+      - name: Download the fp16 model (84 MB) and convert it to fp32
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path models | Out-Null
           Invoke-WebRequest -Uri "https://huggingface.co/monteslu/htdemucs-ft-webgpu/resolve/main/htdemucs_ft_vocals_safe16.onnx" -OutFile models/htdemucs_ft_vocals_safe16.onnx
-          Get-Item models/htdemucs_ft_vocals_safe16.onnx | Select-Object Length
+          pip install onnx
+          python tools/convert_fp32.py models/htdemucs_ft_vocals_safe16.onnx models/htdemucs_ft_vocals_fp32.onnx
+          Remove-Item models/htdemucs_ft_vocals_safe16.onnx
+          Get-Item models/htdemucs_ft_vocals_fp32.onnx | Select-Object Length
 
       - name: Build with PyInstaller
         run: pyinstaller mixage.spec --noconfirm

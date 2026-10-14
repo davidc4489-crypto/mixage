@@ -8,6 +8,9 @@ uniquement la musique. Tout tourne en local, sans envoyer le fichier en ligne.
 - Export « core » (monteslu/htdemucs-ft-webgpu, MIT) : la transformée de Fourier est
   calculée en numpy (`mixage/dsp.py`) et non dans le graphe ONNX. Le graphe passe de
   25 000 à 3 300 opérations, ce qui le rend exploitable sur carte graphique.
+- Le modèle publié calcule en fp16 ; `tools/convert_fp32.py` le convertit en fp32 complet.
+  En fp16, la variance du prologue déborde sur carte graphique (sortie NaN, fichier
+  silencieux) ; en fp32 le résultat est exact et le processeur va 30 % plus vite.
 - Instrumental = mix original − voix estimée (même taux d'échantillonnage que l'entrée).
 - Entrées acceptées : mp3, wav, flac, ogg… Sortie : WAV ou MP3, à côté du fichier d'origine
   (`<nom> (instrumental).wav`).
@@ -22,8 +25,8 @@ python3 -m venv .venv
 .venv/bin/python -m mixage chanson.mp3 --mp3
 ```
 
-Au premier lancement, le modèle (84 Mo) est téléchargé dans le dossier
-utilisateur (`%LOCALAPPDATA%\Mixage\models` sous Windows, `~/.cache/Mixage/models` sous Linux),
+Au premier lancement, le modèle fp32 (175 Mo, Release `model-v1` de ce dépôt) est
+téléchargé dans le dossier utilisateur (`%LOCALAPPDATA%\Mixage\models` sous Windows, `~/.cache/Mixage/models` sous Linux),
 sauf s'il est déjà fourni dans `./models/` ou intégré à l'exécutable.
 
 ## Exécutable Windows
@@ -36,6 +39,8 @@ une Release à chaque tag `v*`. Pour construire à la main sous Windows :
 pip install -r requirements.txt pyinstaller
 mkdir models
 curl -L -o models\htdemucs_ft_vocals_safe16.onnx https://huggingface.co/monteslu/htdemucs-ft-webgpu/resolve/main/htdemucs_ft_vocals_safe16.onnx
+pip install onnx
+python tools\convert_fp32.py models\htdemucs_ft_vocals_safe16.onnx models\htdemucs_ft_vocals_fp32.onnx
 pyinstaller mixage.spec
 ```
 
@@ -53,8 +58,8 @@ sur le processeur. `Mixage.exe --info` affiche les accélérateurs et cartes dé
 
 ## Performances et mémoire
 
-Mesuré sur un PC 8 cœurs sans GPU : environ 1,3 × la durée de la chanson
-(une chanson de 3 min prend 4 min), pic mémoire d'environ 3 Go pendant un morceau.
+Mesuré sur un portable i5 4 cœurs sans GPU : environ 0,8 × la durée de la chanson
+(30 s d'audio en 25 s), pic mémoire d'environ 2,6 Go pendant un morceau.
 Sur carte graphique via DirectML, la vitesse dépend de la carte (à mesurer avec le
 bouton « Test de vitesse » de l'interface, qui chronomètre un morceau de 7,8 s sur la
 carte puis sur le processeur).
