@@ -1,0 +1,50 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Download the model (165 MB)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path models | Out-Null
+          Invoke-WebRequest -Uri "https://huggingface.co/StemSplitio/htdemucs-ft-vocals-onnx/resolve/main/htdemucs_ft_vocals_fp16weights.onnx" -OutFile models/htdemucs_ft_vocals_fp16weights.onnx
+          Get-Item models/htdemucs_ft_vocals_fp16weights.onnx | Select-Object Length
+
+      - name: Build with PyInstaller
+        run: pyinstaller mixage.spec --noconfirm
+
+      - name: Smoke test (CLI on a generated tone)
+        shell: pwsh
+        run: |
+          python -c "import numpy as np, soundfile as sf; sr=44100; t=np.arange(sr*3)/sr; x=np.stack([np.sin(2*np.pi*220*t), np.sin(2*np.pi*330*t)],1)*0.3; sf.write('tone.wav', x.astype('float32'), sr)"
+          & dist/Mixage.exe tone.wav -o tone_instrumental.wav
+          Get-Item tone_instrumental.wav | Select-Object Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Mixage-windows
+          path: dist/Mixage.exe
+
+      - name: Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Mixage.exe
