@@ -53,8 +53,12 @@ Sous Windows, l'application utilise la carte graphique via **DirectML** (DirectX
 ce qui couvre les cartes NVIDIA, AMD et Intel (intégrées ou dédiées) sans pilote
 supplémentaire. Le choix se fait dans l'interface (« Calcul : Automatique / Carte graphique /
 Processeur ») ou en ligne de commande avec `--device auto|gpu|cpu`. En mode automatique,
-si aucune carte n'est détectée ou si elle échoue en cours de route, le traitement bascule
-sur le processeur. `Mixage.exe --info` affiche les accélérateurs et cartes détectés.
+le premier morceau calculé sur la carte est comparé au même morceau calculé sur le
+processeur : si l'écart dépasse 5 %, l'application essaie d'autres configurations
+DirectML (sans « metacommands », niveaux d'optimisation réduits) et mémorise celle qui
+donne un résultat juste (`%LOCALAPPDATA%\Mixage\gpu_config.json`). Si aucune ne convient,
+ou si la carte échoue ou devient trop lente en cours de route, le traitement bascule sur
+le processeur. `Mixage.exe --info` affiche les accélérateurs et cartes détectés.
 
 ## Performances et mémoire
 

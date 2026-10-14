@@ -186,9 +186,13 @@ def describe_devices() -> str:
     """Texte de diagnostic : fournisseurs disponibles et cartes détectées."""
     provs = ", ".join(label for _, label in available_gpu_providers()) or "aucun"
     gpus = ", ".join(list_gpus()) or ("non détectée" if sys.platform == "win32" else "n/a hors Windows")
+    saved = _load_saved_gpu_config()
+    cfg = (f"niveau {saved['level']}, options {saved['options']}" if saved
+           else "aucune encore validée")
     return (f"ONNX Runtime {ort.__version__}\n"
             f"Accélérateurs disponibles : {provs}\n"
-            f"Cartes graphiques : {gpus}")
+            f"Cartes graphiques : {gpus}\n"
+            f"Configuration carte graphique mémorisée : {cfg}")
 
 
 def default_threads() -> int:
@@ -196,12 +200,14 @@ def default_threads() -> int:
     return max(1, min(n, 4))
 
 
-def _base_options(threads: int | None) -> ort.SessionOptions:
+def _base_options(threads: int | None,
+                  level: ort.GraphOptimizationLevel = ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
+                  ) -> ort.SessionOptions:
     so = ort.SessionOptions()
     # Mesuré sur le modèle core : l'arena mémoire + mem_pattern font monter la
     # RAM à 5-6 Go ; sans eux, 0,4 Go avec les optimisations complètes
     # (mem_pattern doit de toute façon être désactivé avec DirectML).
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.graph_optimization_level = level
     so.enable_cpu_mem_arena = False
     so.enable_mem_pattern = False
     so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
@@ -211,16 +217,61 @@ def _base_options(threads: int | None) -> ort.SessionOptions:
     return so
 
 
-def _gpu_provider_attempts(provider: str) -> list[list]:
-    """Variantes d'options à essayer pour un fournisseur GPU, de la plus
-    précise à la plus simple (les noms d'options varient selon la version)."""
+_LEVELS = {
+    "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
+    "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
+    "basic": ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
+    "disable": ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
+}
+
+
+def _gpu_configs(provider: str) -> list[dict]:
+    """Configurations à essayer, dans l'ordre, pour un fournisseur GPU.
+
+    Chaque configuration est vérifiée sur le premier morceau contre le CPU ;
+    la première qui donne un résultat juste est conservée (et mémorisée).
+    Les « metacommands » DirectML sont des noyaux fournis par le pilote de la
+    carte : rapides, mais source connue de résultats faux sur certains pilotes.
+    """
     if provider == "DmlExecutionProvider":
         return [
-            [(provider, {"performance_preference": "high_performance", "device_filter": "gpu"})],
-            [(provider, {"device_id": 0})],
-            [provider],
+            {"provider": provider, "level": "all", "options": {"device_id": 0}},
+            {"provider": provider, "level": "all", "options": {"device_id": 0, "disable_metacommands": "1"}},
+            {"provider": provider, "level": "basic", "options": {"device_id": 0, "disable_metacommands": "1"}},
+            {"provider": provider, "level": "disable", "options": {"device_id": 0, "disable_metacommands": "1"}},
+            {"provider": provider, "level": "disable", "options": {}},
         ]
-    return [[provider]]
+    return [{"provider": provider, "level": "all", "options": {}},
+            {"provider": provider, "level": "disable", "options": {}}]
+
+
+def gpu_config_path() -> Path:
+    return user_model_dir().parent / "gpu_config.json"
+
+
+def _load_saved_gpu_config() -> dict | None:
+    try:
+        import json
+        cfg = json.loads(gpu_config_path().read_text(encoding="utf-8"))
+        if cfg.get("model") == MODEL_FILENAME and cfg.get("ort") == ort.__version__:
+            return cfg["config"]
+    except Exception:
+        pass
+    return None
+
+
+def _save_gpu_config(cfg: dict | None) -> None:
+    try:
+        import json
+        gpu_config_path().parent.mkdir(parents=True, exist_ok=True)
+        if cfg is None:
+            gpu_config_path().unlink(missing_ok=True)
+        else:
+            gpu_config_path().write_text(json.dumps(
+                {"model": MODEL_FILENAME, "ort": ort.__version__, "config": cfg},
+                ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
 
 
 class Separator:
@@ -228,111 +279,148 @@ class Separator:
 
     ``device`` : "auto" (carte graphique si possible), "gpu" (carte graphique
     obligatoire, erreur sinon) ou "cpu".
+
+    Sur carte graphique, le premier morceau est recalculé sur le CPU et comparé :
+    si l'écart dépasse ``VERIFY_TOLERANCE``, la configuration suivante est
+    essayée ; si aucune ne convient, tout le reste se fait sur le CPU.
     """
 
-    def __init__(self, model_path: Path, device: Device = "auto",
-                 threads: int | None = None) -> None:
-        self.model_path = Path(model_path)
-        self.threads = threads
-        self.session: ort.InferenceSession | None = None
-        self.device_used = ""
-        self.on_gpu = False
-        self.notes: list[str] = []
-        self.gpu_runs = 0
-
-        if device not in ("auto", "gpu", "cpu"):
-            raise ValueError(f"device inconnu : {device!r}")
-        if device != "cpu":
-            self._try_gpu(required=(device == "gpu"))
-        if self.session is None:
-            self._use_cpu()
-
-    # -- création ----------------------------------------------------------
-    def _try_gpu(self, required: bool) -> None:
-        providers = available_gpu_providers()
-        if not providers:
-            msg = "aucun accélérateur graphique disponible dans cette version"
-            if required:
-                raise RuntimeError("Carte graphique demandée mais " + msg + ".")
-            self.notes.append(msg)
-            return
-        gpus = list_gpus()
-        if sys.platform == "win32" and not gpus:
-            msg = "aucune carte graphique physique détectée"
-            if required:
-                raise RuntimeError("Carte graphique demandée mais " + msg + ".")
-            self.notes.append(msg)
-            return
-        last_err: Exception | None = None
-        for provider, label in providers:
-            for attempt in _gpu_provider_attempts(provider):
-                try:
-                    sess = ort.InferenceSession(str(self.model_path),
-                                                sess_options=_base_options(self.threads),
-                                                providers=attempt + ["CPUExecutionProvider"])
-                    if provider not in sess.get_providers():
-                        raise RuntimeError(f"{label} non activé par ONNX Runtime")
-                    self.session = sess
-                    self.on_gpu = True
-                    name = gpus[0] if gpus else label
-                    self.device_used = f"Carte graphique ({label}) – {name}"
-                    log.info("session GPU créée : %s avec options %r", self.device_used, attempt)
-                    return
-                except Exception as exc:  # noqa: BLE001
-                    last_err = exc
-        msg = f"carte graphique inutilisable ({type(last_err).__name__}: {last_err})"
-        if required:
-            raise RuntimeError(msg)
-        self.notes.append(msg)
-
-    def _use_cpu(self) -> None:
-        self.session = ort.InferenceSession(str(self.model_path),
-                                            sess_options=_base_options(self.threads),
-                                            providers=["CPUExecutionProvider"])
-        self.on_gpu = False
-        self.device_used = f"Processeur ({self.threads or default_threads()} threads)"
-        log.info("session CPU créée : %s", self.device_used)
-
-    # -- inférence ---------------------------------------------------------
     #: Délai maximal pour le premier morceau sur carte graphique (compilation
     #: des opérateurs incluse), puis pour les suivants. Au-delà : repli CPU.
     GPU_FIRST_TIMEOUT_S = 150.0
     GPU_TIMEOUT_S = 25.0
+    #: Écart relatif toléré entre carte graphique et CPU sur le premier morceau.
+    VERIFY_TOLERANCE = 0.05
+    #: En dessous de ce niveau RMS, un morceau est jugé trop silencieux pour servir
+    #: de référence de vérification.
+    VERIFY_MIN_RMS = 0.01
 
+    def __init__(self, model_path: Path, device: Device = "auto",
+                 threads: int | None = None, verify: bool = True) -> None:
+        self.model_path = Path(model_path)
+        self.threads = threads
+        self.verify = verify
+        self.session: ort.InferenceSession | None = None
+        self._cpu_session: ort.InferenceSession | None = None
+        self.device_used = ""
+        self.on_gpu = False
+        self.notes: list[str] = []
+        self.gpu_runs = 0
+        self.gpu_config: dict | None = None
+        self._pending: list[dict] = []
+        self._gpu_label = ""
+        self._gpu_name = ""
+
+        if device not in ("auto", "gpu", "cpu"):
+            raise ValueError(f"device inconnu : {device!r}")
+        self._required = device == "gpu"
+        if device != "cpu":
+            self._start_gpu()
+        if self.session is None:
+            self._use_cpu()
+
+    # -- création ----------------------------------------------------------
+    def _start_gpu(self) -> None:
+        providers = available_gpu_providers()
+        if not providers:
+            return self._no_gpu("aucun accélérateur graphique disponible dans cette version")
+        gpus = list_gpus()
+        if sys.platform == "win32" and not gpus:
+            return self._no_gpu("aucune carte graphique physique détectée")
+        self._gpu_name = gpus[0] if gpus else ""
+        self._pending = []
+        for provider, label in providers:
+            self._pending += [dict(c, label=label) for c in _gpu_configs(provider)]
+        saved = _load_saved_gpu_config()
+        if saved is not None:
+            self._pending = [c for c in self._pending if c != saved]
+            self._pending.insert(0, saved)
+        if not self._open_next_gpu_config():
+            self._no_gpu("carte graphique inutilisable (aucune configuration n'a pu démarrer)")
+
+    def _no_gpu(self, msg: str) -> None:
+        if self._required:
+            raise RuntimeError("Carte graphique demandée mais " + msg + ".")
+        self.notes.append(msg)
+        log.info("GPU indisponible : %s", msg)
+
+    def _open_next_gpu_config(self) -> bool:
+        """Ouvre la prochaine configuration GPU candidate. False si plus aucune."""
+        while self._pending:
+            cfg = self._pending.pop(0)
+            provider, label = cfg["provider"], cfg.get("label", cfg["provider"])
+            attempts = [[(provider, cfg["options"])], [provider]] if cfg["options"] else [[provider]]
+            for prov_list in attempts:
+                try:
+                    sess = ort.InferenceSession(
+                        str(self.model_path),
+                        sess_options=_base_options(self.threads, _LEVELS[cfg["level"]]),
+                        providers=prov_list + ["CPUExecutionProvider"])
+                    if provider not in sess.get_providers():
+                        raise RuntimeError(f"{label} non activé par ONNX Runtime")
+                    self.session = sess
+                    self.on_gpu = True
+                    self.gpu_config = {k: cfg[k] for k in ("provider", "level", "options")}
+                    self._gpu_label = label
+                    self.device_used = f"Carte graphique ({label}) – {self._gpu_name or label}"
+                    log.info("session GPU ouverte : %s, niveau %s, options %r",
+                             self.device_used, cfg["level"], prov_list[0])
+                    return True
+                except Exception as exc:  # noqa: BLE001
+                    log.info("configuration GPU refusée (%s, %r) : %s", cfg["level"], prov_list[0], exc)
+        return False
+
+    def _use_cpu(self) -> None:
+        if self._cpu_session is None:
+            self._cpu_session = ort.InferenceSession(
+                str(self.model_path), sess_options=_base_options(self.threads),
+                providers=["CPUExecutionProvider"])
+            log.info("session CPU créée (%d threads)", self.threads or default_threads())
+        self.session = self._cpu_session
+        self.on_gpu = False
+        self.gpu_config = None
+        self.device_used = f"Processeur ({self.threads or default_threads()} threads)"
+
+    # -- inférence ---------------------------------------------------------
     @staticmethod
-    def _infer(session: ort.InferenceSession, chunk: np.ndarray) -> np.ndarray:
-        """(2, N) -> voix (2, N) : STFT numpy, modèle, iSTFT numpy."""
+    def _infer_raw(session: ort.InferenceSession, chunk: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         x, xt = session.run(["x", "xt"], dsp.model_inputs(chunk))
-        return dsp.stem_from_outputs(x[0, VOCALS_ROW], xt[0, VOCALS_ROW], chunk.shape[-1])
+        return x[0, VOCALS_ROW], xt[0, VOCALS_ROW]
+
+    @classmethod
+    def _infer(cls, session: ort.InferenceSession, chunk: np.ndarray) -> np.ndarray:
+        """(2, N) -> voix (2, N) : STFT numpy, modèle, iSTFT numpy."""
+        x_src, xt_src = cls._infer_raw(session, chunk)
+        return dsp.stem_from_outputs(x_src, xt_src, chunk.shape[-1])
 
     def _run_cpu(self, x: np.ndarray) -> np.ndarray:
-        assert self.session is not None
-        return self._infer(self.session, x)
+        if self._cpu_session is None:
+            self._use_cpu() if not self.on_gpu else self._ensure_cpu_session()
+        return self._infer(self._cpu_session, x)
+
+    def _ensure_cpu_session(self) -> None:
+        if self._cpu_session is None:
+            self._cpu_session = ort.InferenceSession(
+                str(self.model_path), sess_options=_base_options(self.threads),
+                providers=["CPUExecutionProvider"])
+            log.info("session CPU créée (%d threads)", self.threads or default_threads())
 
     def _fallback(self, reason: str) -> None:
         log.warning("repli CPU : %s", reason)
         self.notes.append(reason + ", repli sur le processeur")
+        _save_gpu_config(None)
         self.session = None
         self._use_cpu()
 
-    def run(self, x: np.ndarray, cancel: threading.Event | None = None) -> np.ndarray:
-        """Voix estimée (2, N) pour un segment (2, N).
-
-        Sur carte graphique, le calcul tourne dans un thread surveillé : s'il
-        échoue, dépasse le délai de garde ou si l'utilisateur annule, on
-        bascule sur le processeur (le thread orphelin est abandonné).
-        """
-        assert self.session is not None
-        if not self.on_gpu:
-            return self._run_cpu(x)
-
-        timeout = self.GPU_FIRST_TIMEOUT_S if self.gpu_runs == 0 else self.GPU_TIMEOUT_S
+    def _run_gpu_guarded(self, x: np.ndarray, cancel: threading.Event | None,
+                         timeout: float) -> tuple[np.ndarray | None, str | None]:
+        """Exécute sur le GPU dans un thread surveillé. Retourne (résultat, erreur)."""
         result: dict = {}
         session = self.session
 
         def worker() -> None:
             try:
-                result["y"] = self._infer(session, x)
+                result["y"] = self._infer_raw(session, x)
             except Exception as exc:  # noqa: BLE001
                 result["err"] = exc
 
@@ -344,22 +432,82 @@ class Separator:
             if cancel is not None and cancel.is_set():
                 raise Cancelled()
             if time.time() - t0 > timeout:
-                self._fallback(f"carte graphique trop lente (plus de {timeout:.0f} s pour un morceau)")
-                return self._run_cpu(x)
+                return None, f"carte graphique trop lente (plus de {timeout:.0f} s pour un morceau)"
         if "err" in result:
-            self._fallback(f"échec sur la carte graphique ({type(result['err']).__name__}: {result['err']})")
+            return None, f"échec sur la carte graphique ({type(result['err']).__name__}: {result['err']})"
+        return result["y"], None
+
+    def _verify_first_chunk(self, x: np.ndarray, cancel: threading.Event | None) -> np.ndarray:
+        """Premier morceau : compare chaque configuration GPU au CPU, garde la bonne."""
+        self._ensure_cpu_session()
+        t0 = time.time()
+        ref_x, ref_xt = self._infer_raw(self._cpu_session, x)
+        ref = dsp.stem_from_outputs(ref_x, ref_xt, x.shape[-1])
+        log.info("référence CPU du premier morceau : %.1f s", time.time() - t0)
+        tried = 0
+        while self.on_gpu:
+            tried += 1
+            t0 = time.time()
+            raw, err = self._run_gpu_guarded(x, cancel, self.GPU_FIRST_TIMEOUT_S)
+            dt = time.time() - t0
+            if raw is not None:
+                gx, gxt = raw
+                y = dsp.stem_from_outputs(gx, gxt, x.shape[-1])
+                finite = bool(np.isfinite(gx).all() and np.isfinite(gxt).all())
+                # dénominateur plancher : 1 % de l'énergie du mix, pour ne pas
+                # rejeter un GPU juste sur un passage sans voix
+                denom = max(float(np.linalg.norm(ref)), 0.01 * float(np.linalg.norm(x)), 1e-9)
+                rel = float(np.linalg.norm(y - ref) / denom) if finite else float("inf")
+                rel_x = float(np.linalg.norm(gx - ref_x) / (np.linalg.norm(ref_x) + 1e-9)) if finite else float("inf")
+                rel_xt = float(np.linalg.norm(gxt - ref_xt) / (np.linalg.norm(ref_xt) + 1e-9)) if finite else float("inf")
+                log.info("vérification GPU (%s, %r) : %.1f s, fini=%s, écart voix %.3g "
+                         "(spectre %.3g, temporel %.3g ; rms gpu %.3g / cpu %.3g)",
+                         self.gpu_config["level"], self.gpu_config["options"], dt, finite, rel,
+                         rel_x, rel_xt, float(np.sqrt(np.mean(y ** 2))), float(np.sqrt(np.mean(ref ** 2))))
+                if rel < self.VERIFY_TOLERANCE:
+                    self.gpu_runs += 1
+                    _save_gpu_config(self.gpu_config)
+                    if tried > 1:
+                        self.notes.append(f"carte graphique validée après {tried} configurations "
+                                          f"(niveau {self.gpu_config['level']}, options {self.gpu_config['options']})")
+                    return y
+                err = f"résultat faux sur la carte graphique (écart {rel:.0%} vs processeur)"
+            log.warning("configuration GPU écartée : %s", err)
+            self.session = None
+            if not self._open_next_gpu_config():
+                self.on_gpu = False
+                self._fallback(f"{err} ; {tried} configuration(s) essayée(s)")
+                return ref
+        return ref
+
+    def run(self, x: np.ndarray, cancel: threading.Event | None = None) -> np.ndarray:
+        """Voix estimée (2, N) pour un segment (2, N)."""
+        if not self.on_gpu:
             return self._run_cpu(x)
-        y = result["y"]
-        if not np.isfinite(y).all() or (np.abs(x).max() > 1e-4 and np.abs(y).max() < 1e-7):
-            self._fallback("résultat invalide sur la carte graphique (NaN ou silence)")
+        if self.gpu_runs == 0 and self.verify:
+            if float(np.sqrt(np.mean(x ** 2))) < self.VERIFY_MIN_RMS:
+                # Morceau quasi silencieux (intro) : comparaison peu fiable,
+                # on le calcule sur le CPU et on vérifiera le prochain.
+                log.info("morceau quasi silencieux : calcul CPU, vérification GPU reportée")
+                return self._run_cpu(x)
+            return self._verify_first_chunk(x, cancel)
+        timeout = self.GPU_FIRST_TIMEOUT_S if self.gpu_runs == 0 else self.GPU_TIMEOUT_S
+        t0 = time.time()
+        raw, err = self._run_gpu_guarded(x, cancel, timeout)
+        if raw is None:
+            self._fallback(err or "erreur inconnue")
             return self._run_cpu(x)
-        dt = time.time() - t0
+        gx, gxt = raw
+        if not (np.isfinite(gx).all() and np.isfinite(gxt).all()):
+            self._fallback("résultat invalide sur la carte graphique (NaN)")
+            return self._run_cpu(x)
         self.gpu_runs += 1
-        log.info("morceau GPU %d : %.1f s", self.gpu_runs, dt)
-        return result["y"]
+        log.info("morceau GPU %d : %.1f s", self.gpu_runs, time.time() - t0)
+        return dsp.stem_from_outputs(gx, gxt, x.shape[-1])
 
     def close(self) -> None:
         self.session = None
+        self._cpu_session = None
 
 
 def make_session(model_path: Path, threads: int | None = None) -> ort.InferenceSession:
