@@ -5,6 +5,9 @@ uniquement la musique. Tout tourne en local, sans envoyer le fichier en ligne.
 
 - Modèle : HT-Demucs (spécialiste voix, `htdemucs_ft_vocals`) au format ONNX,
   exécuté par ONNX Runtime. Pas de PyTorch : l'exécutable reste léger.
+- Export « core » (monteslu/htdemucs-ft-webgpu, MIT) : la transformée de Fourier est
+  calculée en numpy (`mixage/dsp.py`) et non dans le graphe ONNX. Le graphe passe de
+  25 000 à 3 300 opérations, ce qui le rend exploitable sur carte graphique.
 - Instrumental = mix original − voix estimée (même taux d'échantillonnage que l'entrée).
 - Entrées acceptées : mp3, wav, flac, ogg… Sortie : WAV ou MP3, à côté du fichier d'origine
   (`<nom> (instrumental).wav`).
@@ -19,7 +22,7 @@ python3 -m venv .venv
 .venv/bin/python -m mixage chanson.mp3 --mp3
 ```
 
-Au premier lancement, le modèle (165 Mo) est téléchargé dans le dossier
+Au premier lancement, le modèle (84 Mo) est téléchargé dans le dossier
 utilisateur (`%LOCALAPPDATA%\Mixage\models` sous Windows, `~/.cache/Mixage/models` sous Linux),
 sauf s'il est déjà fourni dans `./models/` ou intégré à l'exécutable.
 
@@ -32,7 +35,7 @@ une Release à chaque tag `v*`. Pour construire à la main sous Windows :
 ```bat
 pip install -r requirements.txt pyinstaller
 mkdir models
-curl -L -o models\htdemucs_ft_vocals_fp16weights.onnx https://huggingface.co/StemSplitio/htdemucs-ft-vocals-onnx/resolve/main/htdemucs_ft_vocals_fp16weights.onnx
+curl -L -o models\htdemucs_ft_vocals_safe16.onnx https://huggingface.co/monteslu/htdemucs-ft-webgpu/resolve/main/htdemucs_ft_vocals_safe16.onnx
 pyinstaller mixage.spec
 ```
 
@@ -51,8 +54,13 @@ sur le processeur. `Mixage.exe --info` affiche les accélérateurs et cartes dé
 ## Performances et mémoire
 
 Mesuré sur un PC 8 cœurs sans GPU : environ 1,3 × la durée de la chanson
-(une chanson de 3 min prend 4 min), pic mémoire 1,4 Go.
+(une chanson de 3 min prend 4 min), pic mémoire d'environ 3 Go pendant un morceau.
+Sur carte graphique via DirectML, la vitesse dépend de la carte (à mesurer avec le
+bouton « Test de vitesse » de l'interface, qui chronomètre un morceau de 7,8 s sur la
+carte puis sur le processeur).
 
-Les options ONNX Runtime sont volontairement réglées en « basse mémoire »
-(`ORT_DISABLE_ALL`, pas d'arena) : avec les optimisations par défaut, l'initialisation
-du modèle dépasse 7 Go de RAM et peut bloquer la machine.
+Les options ONNX Runtime sont réglées sans « arena » mémoire ni `mem_pattern` : avec
+les valeurs par défaut, l'inférence de ce modèle monte à 5 ou 6 Go de RAM.
+
+Un journal est écrit dans `%LOCALAPPDATA%\Mixage\mixage.log` (Windows) ou
+`~/.cache/Mixage/mixage.log` : périphérique utilisé, temps par morceau, replis.

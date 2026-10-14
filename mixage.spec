@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 block_cipher = None
-model = Path("models") / "htdemucs_ft_vocals_fp16weights.onnx"
+model = Path("models") / "htdemucs_ft_vocals_safe16.onnx"
 datas = [(str(model), "models")] if model.is_file() else []
 
 try:

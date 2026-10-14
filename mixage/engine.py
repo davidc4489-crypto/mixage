@@ -3,9 +3,14 @@
 Pas de PyTorch. Entrée : n'importe quel fichier audio lisible par
 libsndfile (mp3, wav, flac, ogg...). Sortie : instrumental = mix - voix.
 
+Le modèle est l'export « core » de htdemucs_ft_vocals : la transformée de
+Fourier (STFT / iSTFT) est faite en numpy (voir dsp.py) et non dans le graphe
+ONNX, ce qui divise par 8 le nombre d'opérations et rend le modèle utilisable
+sur carte graphique (DirectML).
+
 Réglages mémoire importants (mesurés sur un PC 8 cœurs / 15 Go) :
-- optimisations de graphe ONNX activées + arena mémoire  -> > 7 Go, plantage
-- optimisations désactivées + sans arena                  -> ~0,9 à 1,7 Go
+- arena mémoire + mem_pattern activés (défaut ORT)  -> 5 à 7 Go, plantage possible
+- sans arena ni mem_pattern                          -> ~0,4 Go
 """
 from __future__ import annotations
 
@@ -17,10 +22,35 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
+import logging
+
 import numpy as np
 import onnxruntime as ort
 import soundfile as sf
 import soxr
+
+from . import dsp
+
+log = logging.getLogger("mixage")
+
+
+def log_path() -> Path:
+    return user_model_dir().parent / "mixage.log"
+
+
+def setup_logging() -> Path:
+    """Journal dans le dossier utilisateur (utile pour diagnostiquer à distance)."""
+    path = log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not any(isinstance(h, logging.FileHandler) for h in log.handlers):
+            h = logging.FileHandler(path, encoding="utf-8")
+            h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            log.addHandler(h)
+            log.setLevel(logging.INFO)
+    except Exception:
+        pass
+    return path
 
 MODEL_SAMPLE_RATE = 44100
 SEGMENT_S = 7.8
@@ -28,10 +58,10 @@ N_SAMPLES = int(SEGMENT_S * MODEL_SAMPLE_RATE)  # 343 980, figé dans le graphe 
 SOURCES = ("drums", "bass", "other", "vocals")
 VOCALS_ROW = SOURCES.index("vocals")
 
-MODEL_FILENAME = "htdemucs_ft_vocals_fp16weights.onnx"
-MODEL_URL = ("https://huggingface.co/StemSplitio/htdemucs-ft-vocals-onnx/"
+MODEL_FILENAME = "htdemucs_ft_vocals_safe16.onnx"
+MODEL_URL = ("https://huggingface.co/monteslu/htdemucs-ft-webgpu/"
              "resolve/main/" + MODEL_FILENAME)
-MODEL_SIZE_BYTES = 165_612_636
+MODEL_SIZE_BYTES = 87_695_109
 
 ProgressCb = Callable[[float, str], None]  # (fraction 0..1, message)
 
@@ -164,11 +194,12 @@ def default_threads() -> int:
 
 def _base_options(threads: int | None) -> ort.SessionOptions:
     so = ort.SessionOptions()
-    # Les optimisations de graphe (constant folding) font exploser la RAM
-    # sur ce modèle ; on les désactive. L'arena pré-alloue aussi des Go.
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    # Mesuré sur le modèle core : l'arena mémoire + mem_pattern font monter la
+    # RAM à 5-6 Go ; sans eux, 0,4 Go avec les optimisations complètes
+    # (mem_pattern doit de toute façon être désactivé avec DirectML).
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     so.enable_cpu_mem_arena = False
-    so.enable_mem_pattern = False          # obligatoire avec DirectML
+    so.enable_mem_pattern = False
     so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     so.intra_op_num_threads = threads or default_threads()
     so.inter_op_num_threads = 1
@@ -203,6 +234,7 @@ class Separator:
         self.device_used = ""
         self.on_gpu = False
         self.notes: list[str] = []
+        self.gpu_runs = 0
 
         if device not in ("auto", "gpu", "cpu"):
             raise ValueError(f"device inconnu : {device!r}")
@@ -240,6 +272,7 @@ class Separator:
                     self.on_gpu = True
                     name = gpus[0] if gpus else label
                     self.device_used = f"Carte graphique ({label}) – {name}"
+                    log.info("session GPU créée : %s avec options %r", self.device_used, attempt)
                     return
                 except Exception as exc:  # noqa: BLE001
                     last_err = exc
@@ -254,21 +287,68 @@ class Separator:
                                             providers=["CPUExecutionProvider"])
         self.on_gpu = False
         self.device_used = f"Processeur ({self.threads or default_threads()} threads)"
+        log.info("session CPU créée : %s", self.device_used)
 
     # -- inférence ---------------------------------------------------------
-    def run(self, x: np.ndarray) -> np.ndarray:
-        """Retourne les stems (4, 2, N) ; bascule sur le CPU si le GPU échoue."""
+    #: Délai maximal pour le premier morceau sur carte graphique (compilation
+    #: des opérateurs incluse), puis pour les suivants. Au-delà : repli CPU.
+    GPU_FIRST_TIMEOUT_S = 150.0
+    GPU_TIMEOUT_S = 25.0
+
+    @staticmethod
+    def _infer(session: ort.InferenceSession, chunk: np.ndarray) -> np.ndarray:
+        """(2, N) -> voix (2, N) : STFT numpy, modèle, iSTFT numpy."""
+        x, xt = session.run(["x", "xt"], dsp.model_inputs(chunk))
+        return dsp.stem_from_outputs(x[0, VOCALS_ROW], xt[0, VOCALS_ROW], chunk.shape[-1])
+
+    def _run_cpu(self, x: np.ndarray) -> np.ndarray:
         assert self.session is not None
-        try:
-            return self.session.run(["stems"], {"mix": x})[0][0]
-        except Exception as exc:  # noqa: BLE001
-            if not self.on_gpu:
-                raise
-            self.notes.append(f"échec sur la carte graphique en cours de traitement "
-                              f"({type(exc).__name__}), repli sur le processeur")
-            self.session = None
-            self._use_cpu()
-            return self.session.run(["stems"], {"mix": x})[0][0]
+        return self._infer(self.session, x)
+
+    def _fallback(self, reason: str) -> None:
+        log.warning("repli CPU : %s", reason)
+        self.notes.append(reason + ", repli sur le processeur")
+        self.session = None
+        self._use_cpu()
+
+    def run(self, x: np.ndarray, cancel: threading.Event | None = None) -> np.ndarray:
+        """Voix estimée (2, N) pour un segment (2, N).
+
+        Sur carte graphique, le calcul tourne dans un thread surveillé : s'il
+        échoue, dépasse le délai de garde ou si l'utilisateur annule, on
+        bascule sur le processeur (le thread orphelin est abandonné).
+        """
+        assert self.session is not None
+        if not self.on_gpu:
+            return self._run_cpu(x)
+
+        timeout = self.GPU_FIRST_TIMEOUT_S if self.gpu_runs == 0 else self.GPU_TIMEOUT_S
+        result: dict = {}
+        session = self.session
+
+        def worker() -> None:
+            try:
+                result["y"] = self._infer(session, x)
+            except Exception as exc:  # noqa: BLE001
+                result["err"] = exc
+
+        th = threading.Thread(target=worker, daemon=True)
+        t0 = time.time()
+        th.start()
+        while th.is_alive():
+            th.join(0.25)
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
+            if time.time() - t0 > timeout:
+                self._fallback(f"carte graphique trop lente (plus de {timeout:.0f} s pour un morceau)")
+                return self._run_cpu(x)
+        if "err" in result:
+            self._fallback(f"échec sur la carte graphique ({type(result['err']).__name__}: {result['err']})")
+            return self._run_cpu(x)
+        dt = time.time() - t0
+        self.gpu_runs += 1
+        log.info("morceau GPU %d : %.1f s", self.gpu_runs, dt)
+        return result["y"]
 
     def close(self) -> None:
         self.session = None
@@ -348,13 +428,17 @@ def separate_vocals(sep: Separator, mix: np.ndarray, *,
         chunk = mix[:, start:end]
         if chunk.shape[1] < N_SAMPLES:
             chunk = np.pad(chunk, ((0, 0), (0, N_SAMPLES - chunk.shape[1])))
-        x = chunk[np.newaxis, ...].astype(np.float32, copy=False)
-        stems = sep.run(x)                                  # (4, 2, N)
-        n = end - start
-        out[:, start:end] += stems[VOCALS_ROW, :, :n] * window[:n]
-        weight[start:end] += window[:n]
+        x = np.ascontiguousarray(chunk, dtype=np.float32)
         if progress:
-            progress((i + 1) / n_chunks, f"Séparation… morceau {i + 1}/{n_chunks}")
+            extra = " (première passe, peut prendre un moment)" if i == 0 and sep.on_gpu else ""
+            progress(i / n_chunks, f"Séparation… morceau {i + 1}/{n_chunks} sur {sep.device_used}{extra}")
+        t_chunk = time.time()
+        vocals = sep.run(x, cancel)                         # (2, N)
+        if i == 0:
+            log.info("premier morceau : %.1f s sur %s", time.time() - t_chunk, sep.device_used)
+        n = end - start
+        out[:, start:end] += vocals[:, :n] * window[:n]
+        weight[start:end] += window[:n]
     return out / np.maximum(weight, 1e-8)
 
 
@@ -374,6 +458,8 @@ def make_instrumental(src: Path, dst: Path | None = None, *, fmt: str = "wav",
     (diagnostics) et "seconds" (durée du traitement).
     """
     t_start = time.time()
+    setup_logging()
+    log.info("début : %s -> %s (device=%s, fmt=%s)", src, dst, device, fmt)
     src = Path(src)
     dst = Path(dst) if dst else output_path_for(src, fmt)
 
@@ -406,5 +492,40 @@ def make_instrumental(src: Path, dst: Path | None = None, *, fmt: str = "wav",
     write_audio(dst, instrumental, sr)
     if info is not None:
         info["seconds"] = time.time() - t_start
+    log.info("terminé en %.0f s sur %s", time.time() - t_start, sep.device_used)
     report(1.0, "Terminé")
     return dst
+
+
+def speed_test(progress: ProgressCb | None = None,
+               cancel: threading.Event | None = None) -> str:
+    """Mesure un morceau de 7,8 s sur la carte graphique (si présente) et sur le CPU."""
+    setup_logging()
+    lines = [describe_devices(), ""]
+    model = ensure_model(progress, cancel)
+    x = (np.random.randn(2, N_SAMPLES) * 0.1).astype(np.float32)
+    for device, label in (("gpu", "Carte graphique"), ("cpu", "Processeur")):
+        if progress:
+            progress(0.5 if device == "cpu" else 0.1, f"Test {label}…")
+        try:
+            sep = Separator(model, device)
+            t0 = time.time()
+            sep.run(x, cancel)                  # première passe (compilation)
+            first = time.time() - t0
+            t0 = time.time()
+            sep.run(x, cancel)
+            second = time.time() - t0
+            if sep.notes:
+                lines.append(f"{label} : {'; '.join(sep.notes)}")
+            else:
+                lines.append(f"{label} ({sep.device_used}) : 1er morceau {first:.1f} s, "
+                             f"2e morceau {second:.1f} s")
+            sep.close()
+        except Cancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"{label} : indisponible ({type(exc).__name__}: {exc})")
+    lines += ["", f"Journal : {log_path()}"]
+    text = "\n".join(lines)
+    log.info("test de vitesse :\n%s", text)
+    return text

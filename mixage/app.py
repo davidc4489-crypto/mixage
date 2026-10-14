@@ -11,7 +11,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
-from .engine import Cancelled, describe_devices, make_instrumental, output_path_for
+from .engine import Cancelled, describe_devices, log_path, make_instrumental, output_path_for, speed_test
 
 DEVICE_CHOICES = [("Automatique (carte graphique si possible)", "auto"),
                   ("Carte graphique", "gpu"),
@@ -95,7 +95,8 @@ class App:
         ttk.Label(dev, text="Calcul :").pack(side="left")
         ttk.Combobox(dev, textvariable=self.device_label, state="readonly", width=38,
                      values=[lbl for lbl, _ in DEVICE_CHOICES]).pack(side="left", padx=(8, 0))
-        ttk.Button(dev, text="Infos matériel", command=self.show_info, width=14).pack(side="right")
+        ttk.Button(dev, text="Test de vitesse", command=self.run_speed_test, width=15).pack(side="right")
+        ttk.Button(dev, text="Infos matériel", command=self.show_info, width=14).pack(side="right", padx=(0, 6))
 
         self.progress = ttk.Progressbar(r, mode="determinate", maximum=1000)
         self.progress.pack(fill="x", pady=(14, 4))
@@ -153,7 +154,26 @@ class App:
         return "auto"
 
     def show_info(self) -> None:
-        messagebox.showinfo("Mixage – matériel", describe_devices())
+        messagebox.showinfo("Mixage – matériel", describe_devices() + f"\n\nJournal : {log_path()}")
+
+    def run_speed_test(self) -> None:
+        if self.worker and self.worker.is_alive():
+            return
+        self.cancel.clear()
+        self._set_busy(True)
+        self.status.config(text="Test de vitesse en cours (jusqu'à quelques minutes)…")
+
+        def work() -> None:
+            try:
+                self.events.put(("speed", speed_test(
+                    progress=lambda f, m: self.events.put(("progress", f, m)), cancel=self.cancel)))
+            except Cancelled:
+                self.events.put(("cancelled",))
+            except Exception as exc:  # noqa: BLE001
+                self.events.put(("error", f"{type(exc).__name__}: {exc}"))
+
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
 
     def start(self) -> None:
         if not self.src:
@@ -191,7 +211,7 @@ class App:
             _open_folder(self.result)
 
     def _set_busy(self, busy: bool) -> None:
-        self.start_btn.config(state="disabled" if busy else "normal")
+        self.start_btn.config(state="disabled" if busy or not self.src else "normal")
         self.cancel_btn.config(state="normal" if busy else "disabled")
         self.drop.config(state="disabled" if busy else "normal")
 
@@ -217,6 +237,13 @@ class App:
                         messagebox.showwarning("Mixage – remarque", "\n".join(important))
                     self.open_btn.config(state="normal")
                     self._set_busy(False)
+                elif kind == "speed":
+                    self.progress["value"] = 0
+                    self.status.config(text="Test de vitesse terminé.")
+                    self._set_busy(False)
+                    if self.src:
+                        self.start_btn.config(state="normal")
+                    messagebox.showinfo("Mixage – test de vitesse", ev[1])
                 elif kind == "cancelled":
                     self.progress["value"] = 0
                     self.status.config(text="Annulé.")

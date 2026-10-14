@@ -24,12 +24,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: Download the model (165 MB)
+      - name: Download the model (84 MB)
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path models | Out-Null
-          Invoke-WebRequest -Uri "https://huggingface.co/StemSplitio/htdemucs-ft-vocals-onnx/resolve/main/htdemucs_ft_vocals_fp16weights.onnx" -OutFile models/htdemucs_ft_vocals_fp16weights.onnx
-          Get-Item models/htdemucs_ft_vocals_fp16weights.onnx | Select-Object Length
+          Invoke-WebRequest -Uri "https://huggingface.co/monteslu/htdemucs-ft-webgpu/resolve/main/htdemucs_ft_vocals_safe16.onnx" -OutFile models/htdemucs_ft_vocals_safe16.onnx
+          Get-Item models/htdemucs_ft_vocals_safe16.onnx | Select-Object Length
 
       - name: Build with PyInstaller
         run: pyinstaller mixage.spec --noconfirm
