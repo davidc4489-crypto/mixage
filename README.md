@@ -39,6 +39,15 @@ pyinstaller mixage.spec
 Le résultat est dans `dist\Mixage.exe`. Windows SmartScreen affichera un avertissement
 car l'exécutable n'est pas signé : « Informations complémentaires » puis « Exécuter quand même ».
 
+## Carte graphique (DirectML)
+
+Sous Windows, l'application utilise la carte graphique via **DirectML** (DirectX 12),
+ce qui couvre les cartes NVIDIA, AMD et Intel (intégrées ou dédiées) sans pilote
+supplémentaire. Le choix se fait dans l'interface (« Calcul : Automatique / Carte graphique /
+Processeur ») ou en ligne de commande avec `--device auto|gpu|cpu`. En mode automatique,
+si aucune carte n'est détectée ou si elle échoue en cours de route, le traitement bascule
+sur le processeur. `Mixage.exe --info` affiche les accélérateurs et cartes détectés.
+
 ## Performances et mémoire
 
 Mesuré sur un PC 8 cœurs sans GPU : environ 1,3 × la durée de la chanson

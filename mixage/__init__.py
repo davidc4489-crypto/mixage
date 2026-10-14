@@ -1,2 +1,2 @@
 """Mixage - retire la voix d'une chanson pour ne garder que la musique."""
-__version__ = "0.1.0"
+__version__ = "0.2.0"

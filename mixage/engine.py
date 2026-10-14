@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import urllib.request
 from pathlib import Path
 from typing import Callable
@@ -108,25 +109,174 @@ def ensure_model(progress: ProgressCb | None = None,
 
 
 # --------------------------------------------------------------------------
-# Session ONNX (réglages basse mémoire)
+# Accélération matérielle (carte graphique) et session ONNX
 # --------------------------------------------------------------------------
+#: Fournisseurs GPU connus d'ONNX Runtime, par ordre de préférence.
+#: DirectML (Windows) couvre NVIDIA, AMD et Intel via DirectX 12.
+GPU_PROVIDERS = (
+    ("DmlExecutionProvider", "DirectML"),
+    ("CUDAExecutionProvider", "CUDA"),
+    ("ROCMExecutionProvider", "ROCm"),
+    ("CoreMLExecutionProvider", "CoreML"),
+)
+#: Adaptateurs logiciels Windows à ignorer : pas de vraie carte graphique.
+_SOFTWARE_ADAPTERS = ("basic display", "basic render", "remote display", "warp", "virtual")
+
+Device = str  # "auto" | "gpu" | "cpu"
+
+
+def list_gpus() -> list[str]:
+    """Noms des cartes graphiques physiques (Windows uniquement, sinon [])."""
+    if sys.platform != "win32":
+        return []
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout
+    except Exception:
+        return []
+    names = [n.strip() for n in out.splitlines() if n.strip()]
+    return [n for n in names if not any(k in n.lower() for k in _SOFTWARE_ADAPTERS)]
+
+
+def available_gpu_providers() -> list[tuple[str, str]]:
+    avail = set(ort.get_available_providers())
+    return [(p, label) for p, label in GPU_PROVIDERS if p in avail]
+
+
+def describe_devices() -> str:
+    """Texte de diagnostic : fournisseurs disponibles et cartes détectées."""
+    provs = ", ".join(label for _, label in available_gpu_providers()) or "aucun"
+    gpus = ", ".join(list_gpus()) or ("non détectée" if sys.platform == "win32" else "n/a hors Windows")
+    return (f"ONNX Runtime {ort.__version__}\n"
+            f"Accélérateurs disponibles : {provs}\n"
+            f"Cartes graphiques : {gpus}")
+
+
 def default_threads() -> int:
     n = os.cpu_count() or 4
     return max(1, min(n, 4))
 
 
-def make_session(model_path: Path, threads: int | None = None) -> ort.InferenceSession:
+def _base_options(threads: int | None) -> ort.SessionOptions:
     so = ort.SessionOptions()
     # Les optimisations de graphe (constant folding) font exploser la RAM
     # sur ce modèle ; on les désactive. L'arena pré-alloue aussi des Go.
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     so.enable_cpu_mem_arena = False
-    so.enable_mem_pattern = False
+    so.enable_mem_pattern = False          # obligatoire avec DirectML
+    so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     so.intra_op_num_threads = threads or default_threads()
     so.inter_op_num_threads = 1
     so.log_severity_level = 3
-    return ort.InferenceSession(str(model_path), sess_options=so,
-                                providers=["CPUExecutionProvider"])
+    return so
+
+
+def _gpu_provider_attempts(provider: str) -> list[list]:
+    """Variantes d'options à essayer pour un fournisseur GPU, de la plus
+    précise à la plus simple (les noms d'options varient selon la version)."""
+    if provider == "DmlExecutionProvider":
+        return [
+            [(provider, {"performance_preference": "high_performance", "device_filter": "gpu"})],
+            [(provider, {"device_id": 0})],
+            [provider],
+        ]
+    return [[provider]]
+
+
+class Separator:
+    """Session ONNX avec choix du périphérique et repli automatique sur le CPU.
+
+    ``device`` : "auto" (carte graphique si possible), "gpu" (carte graphique
+    obligatoire, erreur sinon) ou "cpu".
+    """
+
+    def __init__(self, model_path: Path, device: Device = "auto",
+                 threads: int | None = None) -> None:
+        self.model_path = Path(model_path)
+        self.threads = threads
+        self.session: ort.InferenceSession | None = None
+        self.device_used = ""
+        self.on_gpu = False
+        self.notes: list[str] = []
+
+        if device not in ("auto", "gpu", "cpu"):
+            raise ValueError(f"device inconnu : {device!r}")
+        if device != "cpu":
+            self._try_gpu(required=(device == "gpu"))
+        if self.session is None:
+            self._use_cpu()
+
+    # -- création ----------------------------------------------------------
+    def _try_gpu(self, required: bool) -> None:
+        providers = available_gpu_providers()
+        if not providers:
+            msg = "aucun accélérateur graphique disponible dans cette version"
+            if required:
+                raise RuntimeError("Carte graphique demandée mais " + msg + ".")
+            self.notes.append(msg)
+            return
+        gpus = list_gpus()
+        if sys.platform == "win32" and not gpus:
+            msg = "aucune carte graphique physique détectée"
+            if required:
+                raise RuntimeError("Carte graphique demandée mais " + msg + ".")
+            self.notes.append(msg)
+            return
+        last_err: Exception | None = None
+        for provider, label in providers:
+            for attempt in _gpu_provider_attempts(provider):
+                try:
+                    sess = ort.InferenceSession(str(self.model_path),
+                                                sess_options=_base_options(self.threads),
+                                                providers=attempt + ["CPUExecutionProvider"])
+                    if provider not in sess.get_providers():
+                        raise RuntimeError(f"{label} non activé par ONNX Runtime")
+                    self.session = sess
+                    self.on_gpu = True
+                    name = gpus[0] if gpus else label
+                    self.device_used = f"Carte graphique ({label}) – {name}"
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+        msg = f"carte graphique inutilisable ({type(last_err).__name__}: {last_err})"
+        if required:
+            raise RuntimeError(msg)
+        self.notes.append(msg)
+
+    def _use_cpu(self) -> None:
+        self.session = ort.InferenceSession(str(self.model_path),
+                                            sess_options=_base_options(self.threads),
+                                            providers=["CPUExecutionProvider"])
+        self.on_gpu = False
+        self.device_used = f"Processeur ({self.threads or default_threads()} threads)"
+
+    # -- inférence ---------------------------------------------------------
+    def run(self, x: np.ndarray) -> np.ndarray:
+        """Retourne les stems (4, 2, N) ; bascule sur le CPU si le GPU échoue."""
+        assert self.session is not None
+        try:
+            return self.session.run(["stems"], {"mix": x})[0][0]
+        except Exception as exc:  # noqa: BLE001
+            if not self.on_gpu:
+                raise
+            self.notes.append(f"échec sur la carte graphique en cours de traitement "
+                              f"({type(exc).__name__}), repli sur le processeur")
+            self.session = None
+            self._use_cpu()
+            return self.session.run(["stems"], {"mix": x})[0][0]
+
+    def close(self) -> None:
+        self.session = None
+
+
+def make_session(model_path: Path, threads: int | None = None) -> ort.InferenceSession:
+    """Compatibilité : session CPU seule."""
+    return Separator(model_path, "cpu", threads).session
 
 
 # --------------------------------------------------------------------------
@@ -178,7 +328,7 @@ def _transition_window(segment: int, overlap_frac: float = 0.25) -> np.ndarray:
     return w
 
 
-def separate_vocals(session: ort.InferenceSession, mix: np.ndarray, *,
+def separate_vocals(sep: Separator, mix: np.ndarray, *,
                     progress: ProgressCb | None = None,
                     cancel: threading.Event | None = None) -> np.ndarray:
     """Voix estimée, (2, n) à 44,1 kHz. Découpage 7,8 s avec recouvrement 25 %."""
@@ -199,7 +349,7 @@ def separate_vocals(session: ort.InferenceSession, mix: np.ndarray, *,
         if chunk.shape[1] < N_SAMPLES:
             chunk = np.pad(chunk, ((0, 0), (0, N_SAMPLES - chunk.shape[1])))
         x = chunk[np.newaxis, ...].astype(np.float32, copy=False)
-        stems = session.run(["stems"], {"mix": x})[0][0]   # (4, 2, N)
+        stems = sep.run(x)                                  # (4, 2, N)
         n = end - start
         out[:, start:end] += stems[VOCALS_ROW, :, :n] * window[:n]
         weight[start:end] += window[:n]
@@ -213,10 +363,17 @@ def output_path_for(src: Path, fmt: str = "wav") -> Path:
 
 
 def make_instrumental(src: Path, dst: Path | None = None, *, fmt: str = "wav",
+                      device: Device = "auto",
                       threads: int | None = None,
                       progress: ProgressCb | None = None,
-                      cancel: threading.Event | None = None) -> Path:
-    """Pipeline complet : fichier audio -> fichier instrumental (sans voix)."""
+                      cancel: threading.Event | None = None,
+                      info: dict | None = None) -> Path:
+    """Pipeline complet : fichier audio -> fichier instrumental (sans voix).
+
+    ``info`` (optionnel) reçoit "device" (périphérique utilisé), "notes"
+    (diagnostics) et "seconds" (durée du traitement).
+    """
+    t_start = time.time()
     src = Path(src)
     dst = Path(dst) if dst else output_path_for(src, fmt)
 
@@ -227,21 +384,27 @@ def make_instrumental(src: Path, dst: Path | None = None, *, fmt: str = "wav",
     report(0.0, "Préparation du modèle…")
     model = ensure_model(lambda f, m: report(0.05 * f, m), cancel)
     report(0.05, "Chargement du modèle (quelques secondes)…")
-    session = make_session(model, threads)
+    sep = Separator(model, device, threads)
+    report(0.08, f"Calcul sur : {sep.device_used}")
 
     report(0.10, "Lecture du fichier audio…")
     native, sr = load_audio(src)
     mix = resample(native, sr, MODEL_SAMPLE_RATE)
 
-    vocals = separate_vocals(session, mix,
+    vocals = separate_vocals(sep, mix,
                              progress=lambda f, m: report(0.10 + 0.85 * f, m),
                              cancel=cancel)
-    del session
+    if info is not None:
+        info["device"] = sep.device_used
+        info["notes"] = list(sep.notes)
+    sep.close()
 
     report(0.95, "Écriture du fichier…")
     vocals_native = resample(vocals, MODEL_SAMPLE_RATE, sr)
     n = min(native.shape[1], vocals_native.shape[1])
     instrumental = native[:, :n] - vocals_native[:, :n]
     write_audio(dst, instrumental, sr)
+    if info is not None:
+        info["seconds"] = time.time() - t_start
     report(1.0, "Terminé")
     return dst

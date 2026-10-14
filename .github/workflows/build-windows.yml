@@ -34,12 +34,19 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller mixage.spec --noconfirm
 
-      - name: Smoke test (CLI on a generated tone)
+      - name: Check accelerators inside the exe (DirectML must be listed)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath (Resolve-Path dist/Mixage.exe) -ArgumentList "--info" -Wait -PassThru -NoNewWindow -RedirectStandardOutput info.txt
+          Get-Content info.txt
+          if (-not (Select-String -Path info.txt -Pattern "DirectML" -Quiet)) { Write-Error "DirectML absent de l'exe"; exit 1 }
+
+      - name: Smoke test (CLI on a generated tone, CPU – no GPU on the runner)
         shell: pwsh
         run: |
           python -c "import numpy as np, soundfile as sf; sr=44100; t=np.arange(sr*3)/sr; x=np.stack([np.sin(2*np.pi*220*t), np.sin(2*np.pi*330*t)],1)*0.3; sf.write('tone.wav', x.astype('float32'), sr)"
           # Application sans console : PowerShell n'attend pas sa fin par défaut.
-          $p = Start-Process -FilePath (Resolve-Path dist/Mixage.exe) -ArgumentList "tone.wav","-o","tone_instrumental.wav" -Wait -PassThru -NoNewWindow
+          $p = Start-Process -FilePath (Resolve-Path dist/Mixage.exe) -ArgumentList "tone.wav","-o","tone_instrumental.wav","--device","cpu" -Wait -PassThru -NoNewWindow
           if ($p.ExitCode -ne 0) { Write-Error "Mixage.exe a terminé avec le code $($p.ExitCode)"; exit 1 }
           Get-Item tone_instrumental.wav | Select-Object Length
 
