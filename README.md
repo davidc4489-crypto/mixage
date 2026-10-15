@@ -3,7 +3,12 @@
 Application de bureau (Windows) qui retire la voix d'une chanson et garde
 uniquement la musique. Tout tourne en local, sans envoyer le fichier en ligne.
 
-Deux modèles au choix dans l'interface :
+Interface en trois étapes : la chanson (glisser-déposer ou clic), les réglages (WAV ou MP3,
+« Rapide » ou « Meilleure qualité »), le fichier à créer (emplacement et nom libres, bouton
+« Parcourir… »). Le choix carte graphique / processeur est automatique ; les diagnostics sont en
+ligne de commande (`--info`, `--speed-test`, `--device`).
+
+Deux modèles au choix :
 
 | Modèle | Qualité | Vitesse (i5 4 cœurs, processeur) | Carte graphique |
 |---|---|---|---|
@@ -69,7 +74,7 @@ L'ancien fournisseur DirectML donnait un résultat faux avec ce modèle quelle q
 configuration ; il n'est plus livré dans l'exécutable (le code le gère encore si le paquet
 `onnxruntime-directml` est installé).
 
-Choix dans l'interface (« Calcul ») ou en ligne de commande (`--device`) :
+Choix en ligne de commande (`--device`) ; l'interface graphique est toujours en « Automatique » :
 
 - **Automatique** : carte graphique si elle donne un résultat juste ; si la machine a au moins
   12 Go de mémoire, le processeur travaille en même temps sur d'autres morceaux.
@@ -81,9 +86,9 @@ le processeur ; si l'écart dépasse 5 %, la configuration suivante est essayée
 WebGPU sans optimisation, puis DirectML si présent) et celle qui donne un résultat juste est
 mémorisée (`%LOCALAPPDATA%\Mixage\gpu_config.json`). Si aucune ne convient, ou si la carte
 échoue ou dépasse 30 s sur un morceau en cours de route, le morceau est redonné au processeur
-qui termine seul. `Mixage.exe --info` affiche les accélérateurs et cartes détectés ; le bouton
-« Test de vitesse » chronomètre un morceau de 7,8 s sur la carte, sur le processeur et avec
-Spleeter.
+qui termine seul. `Mixage.exe --info` affiche les accélérateurs et cartes détectés ;
+`Mixage.exe --speed-test` chronomètre un morceau de 7,8 s sur la carte, sur le processeur et avec
+Spleeter (lancer depuis une invite de commandes avec `| more`, l'exe n'a pas de console).
 
 ## Performances et mémoire
 
